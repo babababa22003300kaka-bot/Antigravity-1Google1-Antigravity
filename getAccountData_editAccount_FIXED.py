@@ -505,6 +505,18 @@ async def handle_execute_edit_button(update, context):
             print(f"[EDIT MODE] 🚀 Started monitoring for EXECUTE_ONLY on account_id: {account_id}")
         else:
             print(f"[EDIT MODE] ⚠️ Cannot start monitoring: Missing api_manager or account info")
+        
+        # 🆕 إضافة للـ Edit Queue (تحديث Google Sheets)
+        try:
+            from core import add_to_pending_queue_immediately
+            add_to_pending_queue_immediately(
+                email_for_monitoring,
+                account_id,
+                is_edit=True  # 🆕 تحديث الصف الموجود بدل إضافة صف جديد
+            )
+            print(f"[EDIT MODE] 📊 Added to Edit Queue for Sheets update: {email_for_monitoring}")
+        except Exception as e:
+            print(f"[EDIT MODE] ⚠️ Failed to add to edit queue: {e}")
             
     else:
         await msg.edit_text(
@@ -607,6 +619,18 @@ async def process_edit_input(update, context):
             print(f"[EDIT MODE] 🚀 Started monitoring with account_id: {account_id}")
         else:
             print(f"[EDIT MODE] ⚠️ Cannot start monitoring: api_manager not available")
+        
+        # 🆕 إضافة للـ Edit Queue (تحديث Google Sheets)
+        try:
+            from core import add_to_pending_queue_immediately
+            add_to_pending_queue_immediately(
+                email_for_monitoring,
+                account_id,
+                is_edit=True  # 🆕 تحديث الصف الموجود بدل إضافة صف جديد
+            )
+            print(f"[EDIT MODE] 📊 Added to Edit Queue for Sheets update: {email_for_monitoring}")
+        except Exception as e:
+            print(f"[EDIT MODE] ⚠️ Failed to add to edit queue: {e}")
     else:
         await msg.edit_text(
             f"❌ فشل التعديل\n\n"

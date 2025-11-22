@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+🔧 تعديل بيانات السيندر - نظام منفصل مع Burst Mode Monitoring
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ زر تفاعلي في جروب "جميع الحالات" فقط
+✅ نظام مرن لإدخال البيانات (email, password, backup)
+✅ متوافق مع المشروع الحالي
+✅ 🆕 Burst Mode monitoring بعد التعديل
+✅ 🆕 Smart Edit Summary - رسالة ديناميكية
+✅ 🆕 Execute Button Monitoring - مراقبة بعد التنفيذ المباشر
+✅ 🆕 Google Sheets Edit Queue - تحديث الصفوف بدل التكرار
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+import asyncio
+import json
+import re
+from typing import Dict, Optional, Tuple
+
+import aiohttp
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+# ═══════════════════════════════════════════════════════════
+# ⚙️ تحميل الإعدادات
+# ═══════════════════════════════════════════════════════════
+
+with open("config.json", "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# استخراج معلومات الجروب "جميع الحالات"
+ALL_STATES_GROUP_ID = None
+for group in CONFIG.get("notification_groups", {}).get("groups", []):
+    if group.get("name") == "جميع الحالات":
+        ALL_STATES_GROUP_ID = group.get("group_id")
+        break
+
+# معلومات الموقع
+WEBSITE_CONFIG = CONFIG.get("website", {})
+BASE_URL = WEBSITE_CONFIG.get("urls", {}).get("base", "https://utautotransfer.com")
+COOKIES = WEBSITE_CONFIG.get("cookies", {})
+
+# ═══════════════════════════════════════════════════════════
+# 🆕 استيرادات إضافية للتكامل مع المراقبة
+# ═══════════════════════════════════════════════════════════
+
+from core import monitor_account_task
+
+# 📊 Global vars
+api_manager_instance = None  # 🆕 سيتم تعيينه من main.py عند التشغيل
+
+
+def set_api_manager(api_mgr):
+    """دالة لتعيين api_manager من main.py"""
+    global api_manager_instance
+    api_manager_instance = api_mgr

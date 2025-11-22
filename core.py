@@ -357,11 +357,32 @@ def convert_arabic_numbers(text: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 
-def add_to_pending_queue_immediately(email: str, account_id: str):
+def add_to_pending_queue_immediately(email: str, account_id: str, is_edit: bool = False):
     """
-    🆕 إضافة فورية للإيميل والID في pending.json (بدون انتظار)
-    تستخدم عند اكتشاف الـ ID مباشرة
+    🆕 إضافة فورية للإيميل والID (بدون انتظار)
+    
+    Args:
+        email: البريد الإلكتروني
+        account_id: ID الحساب
+        is_edit: True = تعديل (update existing row), False = إضافة جديدة (new row)
+    
+    التدفق:
+    - is_edit=False → pending.json → إضافة صف جديد في الشيت
+    - is_edit=True → edit_queue.json → تحديث الصف الموجود
     """
+    # 🆕 إذا كان تعديل، نستخدم Edit Handler
+    if is_edit:
+        try:
+            from sheets.edit_handler import add_to_edit_queue
+            add_to_edit_queue(account_id, email)
+            logger.info(f"✏️ Added to EDIT queue: {email} (ID: {account_id})")
+            return
+        except Exception as e:
+            logger.error(f"❌ Failed to add to edit queue: {e}")
+            # Fallback: نضيفه للـ pending كصف جديد
+            logger.warning("⚠️ Falling back to add as new row")
+    
+    # الكود الأصلي (للإضافات الجديدة)
     pending_file = Path("data/pending.json")
     pending_file.parent.mkdir(exist_ok=True)
 

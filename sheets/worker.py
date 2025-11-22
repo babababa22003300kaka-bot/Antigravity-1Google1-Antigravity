@@ -33,6 +33,15 @@ except ImportError:
     TAKEN_WORKER_AVAILABLE = False
     logging.warning("⚠️ Taken Worker not available - will skip")
 
+# 🆕 استيراد آمن للـ Edit Worker
+try:
+    from .edit_handler import start_edit_worker
+
+    EDIT_WORKER_AVAILABLE = True
+except ImportError:
+    EDIT_WORKER_AVAILABLE = False
+    logging.warning("⚠️ Edit Worker not available - will skip")
+
 logger = logging.getLogger(__name__)
 
 
@@ -217,13 +226,20 @@ async def start_sheet_worker(config: Dict):
 
         if TAKEN_WORKER_AVAILABLE:
             logger.info(
-                "🚀 Starting Google Sheets data workers (pending, retry, taken)..."
+                "🚀 Starting Google Sheets data workers (pending, retry, taken, edit)..."
             )
             workers.append(start_taken_worker(config, sheets_api))
         else:
             logger.info(
-                "🚀 Starting Google Sheets data workers (pending, retry only)..."
+                "🚀 Starting Google Sheets data workers (pending, retry, edit only)..."
             )
+        
+        # 🆕 إضافة Edit Worker
+        if EDIT_WORKER_AVAILABLE:
+            workers.append(start_edit_worker(config, sheets_api))
+            logger.info("✅️ Edit Worker added")
+        else:
+            logger.warning("⚠️ Edit Worker not available - email updates in sheets will be skipped")
 
         await asyncio.gather(*workers)
 
