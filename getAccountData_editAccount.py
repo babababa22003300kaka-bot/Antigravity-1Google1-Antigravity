@@ -16,7 +16,7 @@
 import asyncio
 import json
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -110,6 +110,95 @@ def clean_backup_codes(raw_codes: str) -> str:
     cleaned_codes = [code[-8:] for code in found_codes]
     unique_codes = list(dict.fromkeys(cleaned_codes))
     return ",".join(unique_codes)
+
+
+def extract_codes_smart(raw_text: str) -> List[str]:
+    """
+    استخراج ذكي للأكواد الاحتياطية من نص (مثل Add Context)
+    
+    Features:
+    - تحويل أرقام عربية → إنجليزية
+    - استخراج كل الأكواد (8+ digits)
+    - أخذ آخر 8 أرقام فقط
+    - إرجاع list نظيفة
+    
+    Args:
+        raw_text: النص المدخل من User (قد يكون فوضوي)
+    
+    Returns:
+        List[str]: قائمة الأكواد المستخرجة
+        
+    Examples:
+        >>> extract_codes_smart("11111111,22222222")
+        ['11111111', '22222222']
+        
+        >>> extract_codes_smart("الكود ١٢٣٤٥٦٧٨ شكراً")
+        ['12345678']
+        
+        >>> extract_codes_smart("123456789012345678")
+        ['12345678']  # آخر 8 أرقام
+    """
+    if not raw_text or not raw_text.strip():
+        return []
+    
+    # 1️⃣ تحويل أرقام عربية → إنجليزية
+    normalized = convert_arabic_numbers(raw_text)
+    
+    # 2️⃣ استخراج كل الأكواد (8+ digits)
+    found_codes = re.findall(r"\d{8,}", normalized)
+    
+    # 3️⃣ أخذ آخر 8 أرقام من كل كود
+    cleaned_codes = [code[-8:] for code in found_codes]
+    
+    return cleaned_codes
+
+
+def merge_backup_codes(old_codes: str, new_codes_text: str) -> str:
+    """
+    دمج الأكواد القديمة مع الجديدة (بدون تكرار)
+    
+    Flow:
+    1. تحليل الأكواد القديمة (من الموقع)
+    2. استخراج الأكواد الجديدة بذكاء (من User input)
+    3. دمج القائمتين
+    4. إزالة التكرار مع الحفاظ على الترتيب
+    5. إرجاع string مفصول بفاصلة
+    
+    Args:
+        old_codes: الأكواد القديمة من الموقع "11111111,22222222"
+        new_codes_text: النص المدخل من User (قد يحتوي أكواد)
+    
+    Returns:
+        str: الأكواد المدمجة "11111111,22222222,33333333"
+        
+    Examples:
+        >>> merge_backup_codes("11111111,22222222", "33333333")
+        '11111111,22222222,33333333'
+        
+        >>> merge_backup_codes("11111111,22222222", "22222222,33333333")
+        '11111111,22222222,33333333'  # تم إزالة التكرار
+        
+        >>> merge_backup_codes("11111111", "الكود ٢٢٢٢٢٢٢٢")
+        '11111111,22222222'  # استخراج ذكي + تحويل عربي
+    """
+    # 1️⃣ تحليل الأكواد القديمة
+    old_list = []
+    if old_codes and old_codes.strip():
+        old_list = [c.strip() for c in old_codes.split(",") if c.strip()]
+    
+    # 2️⃣ استخراج الأكواد الجديدة بذكاء
+    new_list = extract_codes_smart(new_codes_text)
+    
+    # 3️⃣ دمج القائمتين
+    merged = old_list + new_list
+    
+    # 4️⃣ إزالة التكرار مع الحفاظ على الترتيب
+    # استخدام dict.fromkeys() للحفاظ على الترتيب (Python 3.7+)
+    unique_codes = list(dict.fromkeys(merged))
+    
+    # 5️⃣ إرجاع string
+    return ",".join(unique_codes)
+
 
 
 def parse_inputs(field1, field2, field3):
@@ -329,11 +418,32 @@ async def smart_edit_account(account_id, field1="", field2="", field3="") -> Tup
         print(f"[SMART EDIT]   ✅ Group: {current_data['group']}")
 
         print("\n[SMART EDIT] 3️⃣ Preparing final data for edit...")
+        
+        # 🆕 معالجة خاصة للـ backup codes (دمج ذكي)
+        if parsed["backup"]:
+            # User أدخل أكواد جديدة → دمج مع القديمة
+            final_backup_codes = merge_backup_codes(
+                current_data["backup"],  # الأكواد القديمة من الموقع
+                parsed["backup"]          # النص الجديد من User
+            )
+            print(f"[SMART EDIT]   🔀 Smart Merge enabled for backup codes")
+            
+            # عرض التفاصيل
+            old_count = len(current_data["backup"].split(",")) if current_data["backup"] else 0
+            new_count = len(extract_codes_smart(parsed["backup"]))
+            final_count = len(final_backup_codes.split(",")) if final_backup_codes else 0
+            
+            print(f"[SMART EDIT]      📊 Old codes: {old_count}")
+            print(f"[SMART EDIT]      ➕ New codes: {new_count}")
+            print(f"[SMART EDIT]      ✅ Final (merged): {final_count} unique code(s)")
+        else:
+            # User لم يدخل أكواد جديدة → استخدم القديمة فقط
+            final_backup_codes = current_data["backup"]
 
         final_data = {
             "email": parsed["email"] or current_data["email"],
             "password": parsed["password"] or current_data["password"],
-            "backup": parsed["backup"] or current_data["backup"],
+            "backup": final_backup_codes,  # ← استخدام الدمج الذكي
             "group": current_data["group"],
         }
 
@@ -343,8 +453,7 @@ async def smart_edit_account(account_id, field1="", field2="", field3="") -> Tup
         if parsed["password"]:
             print(f"[SMART EDIT]   🔑 Password: Will be changed")
         if parsed["backup"]:
-            codes_count = len(parsed["backup"].split(","))
-            print(f"[SMART EDIT]   📋 Backup codes: Will be changed ({codes_count} code(s))")
+            print(f"[SMART EDIT]   📋 Backup codes: Merged successfully")
 
         print("\n[SMART EDIT] 4️⃣ Sending edit request to server...")
 
