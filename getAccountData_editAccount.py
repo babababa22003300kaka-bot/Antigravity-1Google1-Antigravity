@@ -397,6 +397,13 @@ async def handle_edit_sender_button(update, context):
     """معالج زر 'تعديل سيندر'"""
     query = update.callback_query
     await query.answer()
+    
+    # 🆕 حذف الزر فوراً لتأكيد بصري للمستخدم
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as e:
+        # لو الرسالة قديمة جداً أو محذوفة، نتجاهل الخطأ
+        print(f"[EDIT MODE] ⚠️ Could not remove button: {e}")
 
     account_id = query.data.split(":")[1] if ":" in query.data else None
 
