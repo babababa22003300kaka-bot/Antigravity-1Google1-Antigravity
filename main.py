@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+🤖 Smart Telegram Sender Bot - Main File
+البوت الرئيسي مع كل الأوامر
+✅ نسخة كاملة مع الإضافة الفورية لـ pending.json
+"""
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from api_manager import OptimizedAPIManager, smart_cache
+from config import FINAL_STATUSES, TRANSITIONAL_STATUSES
+from core import (
+    continuous_monitor,
+    format_number,
+    get_status_description_ar,
+    get_status_emoji,
+    is_admin,
+    load_monitored_accounts,
+    monitor_account_task,  # 🆕 استيراد من core.py
+    parse_sender_data,
+    wait_for_status_change,
+)
+from sheets.worker import start_sheet_worker
+from stats import stats
+from web_api.server import start_web_api
+
+# 🔧 استيراد معالجات تعديل السيندر
+import getAccountData_editAccount as edit_sender_module
+
+# ═══════════════════════════════════════════════════════════════
+# 📝 Logging Configuration
+# ═══════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════════
+# ⚙️ Load Configuration
+# ═══════════════════════════════════════════════════════════════
+
+with open("config.json", "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# ═══════════════════════════════════════════════════════════════
+# 🎯 Global Constants
+# ═══════════════════════════════════════════════════════════════
+
+# 🎯 تحديد حد أقصى 10 خيوط مؤقتة في نفس الوقت
+MAX_CONCURRENT_MONITORS = 10
+monitoring_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MONITORS)
+
+# Global vars
+telegram_app = None
+api_manager = None
+
+# ═══════════════════════════════════════════════════════════════
+# 🎯 Bot Commands
+# ═══════════════════════════════════════════════════════════════
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر /start - الرسالة الترحيبية"""
+    user = update.effective_user
+    admin_ids = CONFIG["telegram"].get("admin_ids", [])
+
+    if not is_admin(user.id, admin_ids):
+        await update.message.reply_text("❌ عذراً، هذا البوت خاص بالمسؤولين.")
+        return
+
+    welcome_msg = (
+        f"مرحباً {user.first_name}! 👋\n\n"
+        "🚀 *بوت السيندرز المتطور*\n"
+        "🧠 *Adaptive Hybrid Monitoring*\n\n"
+        "*📝 طريقة الإضافة:*\n"
+        "```\n"
+        "email@gmail.com\n"
+        "password123\n"
+        "12345678\n"
+        "اسحب 100\n"
+        "يسيب 50\n"
+        "```\n\n"
+        "*✨ المميزات المتقدمة:*\n"
+        "• 🎯 Strict ID Validation\n"
+        "• 🚀 Temporary Burst Mode (60s)\n"
+        "• 🧠 Smart TTL (2-10 دقيقة)\n"
+        "• 🔄 Fallback Mechanism\n"
+        "• 🌐 Bilingual Display\n"
+        "• 🆕 Source Tracking (bot/manual)\n"
+        "• 🆕 Auto-Discovery\n"
+        "• 🆕 Instant Google Sheets Sync\n"
+        "• 🆕 Web API Integration\n\n"
+        "*⏱️ زمن الاستجابة: 3-10 ثوانٍ*\n\n"
+        "*🔍 الأوامر:*\n"
+        "`/search email@gmail.com`\n"
+        "`/monitored` - الحسابات المراقبة\n"
+        "`/stats` - الإحصائيات\n"
+        "`/status` - حالة النظام"
+    )
+
+    await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    [ROUTER] معالج الرسائل النصية الرئيسي
+    
+    يعمل كـ "موجه" (Router) يوجه الرسائل حسب حالة المستخدم:
+    - إذا كان في وضع التعديل → يوجه لـ process_edit_input
+    - إذا كان في الوضع العادي → يتعامل معها كـ إضافة حساب جديد
+    """
+    admin_ids = CONFIG["telegram"].get("admin_ids", [])
+
+    if not is_admin(update.effective_user.id, admin_ids):
+        return
+
+    # تجاهل الأوامر
+    if update.message.text.startswith("/"):
+        return
+    
+    # ═══════════════════════════════════════════════════════════
+    # 🎯 State-Based Routing: التحقق من وضع المستخدم
+    # ═══════════════════════════════════════════════════════════
+    user_id = update.effective_user.id
+    
+    # هل المستخدم في وضع التعديل؟
+    if user_id in edit_sender_module.user_editing_state:
+        account_id = edit_sender_module.user_editing_state[user_id]
+        print(f"\n[ROUTER] 🔀 User {user_id} is in EDIT MODE (account: {account_id})")
+        print(f"[ROUTER] ➡️ Forwarding to edit handler...")
+        
+        # توجيه الرسالة لمعالج التعديل
+        await edit_sender_module.process_edit_input(update, context)
+        return  # ⬅️ مهم جداً: الخروج هنا لمنع تنفيذ كود الإضافة
+    
+    # المستخدم في الوضع العادي → معالجة كـ إضافة
+    print(f"\n[ROUTER] 🔀 User {user_id} is in NORMAL MODE")
+    print(f"[ROUTER] ➡️ Processing as new account addition...")
+
+    # ═══════════════════════════════════════════════════════════
+    # ➕ معالجة إضافة حساب جديد (الكود الأصلي)
+    # ═══════════════════════════════════════════════════════════
+    
+    # تحليل البيانات
+    data = parse_sender_data(update.message.text)
+
+    if not data["email"] or not data["password"]:
+        await update.message.reply_text(
+            "❌ بيانات ناقصة! تأكد من إدخال الإيميل والباسورد."
+        )
+        return
+
+    msg = await update.message.reply_text(
+        f"⏳ *جاري الإضافة...*\n📧 `{data['email']}`", parse_mode="Markdown"
+    )
+
+    try:
+        # إضافة الحساب
+        success, message = await api_manager.add_sender(
+            email=data["email"],
+            password=data["password"],
+            backup_codes=data["codes"],
+            amount_take=data["amount_take"],
+            amount_keep=data["amount_keep"],
+        )
+
+        if success:
+            # 🆕 الحل الجذري: نجلب account_id فوراً بعد الإضافة
+            logger.info(f"✅ Account added successfully, fetching account_id for: {data['email']}")
+            
+            # جلب الحساب للحصول على ID
+            added_account = None
+            account_id_for_monitoring = None
+            
+            try:
+                # انتظار بسيط (0.5s) لضمان تسجيل الحساب
+                await asyncio.sleep(0.5)
+                added_account = await api_manager.search_sender_by_email(data["email"])
+                
+                if added_account:
+                    account_id_for_monitoring = added_account.get("ID") or added_account.get("idAccount")
+                    logger.info(f"✅ Got account_id: {account_id_for_monitoring}")
+                    
+                    # 🆕 إضافة للـ pending queue (فقط عند الإضافة الجديدة)
+                    if account_id_for_monitoring:
+                        from core import add_to_pending_queue_immediately
+                        add_to_pending_queue_immediately(data["email"], account_id_for_monitoring)
+                        logger.info(f"📝 Added to pending.json: {account_id_for_monitoring}")
+                else:
+                    logger.warning(f"⚠️ Could not fetch account_id for {data['email']}, will use email search fallback")
+            except Exception as e:
+                logger.warning(f"⚠️ Error fetching account_id: {e}, will use email search fallback")
+            
+            await msg.edit_text(
+                f"✅ *تمت الإضافة!*\n"
+                f"📧 `{data['email']}`\n\n"
+                f"🚀 *تفعيل BURST MODE...*\n"
+                f"⏱️ متوقع: 3-10 ثوانٍ",
+                parse_mode="Markdown",
+            )
+
+            # ✅ الحل النهائي: تمرير account_id لتخطي البحث بالإيميل
+            asyncio.create_task(
+                monitor_account_task(
+                    api_manager,
+                    data["email"],
+                    msg,
+                    update.effective_chat.id,
+                    CONFIG["website"]["defaults"]["group_name"],
+                    is_edit_context=False,  # إضافة جديدة
+                    account_id=account_id_for_monitoring,  # 🎯 تمرير ID مباشرة - يحل Race Condition
+                )
+            )
+
+        else:
+            await msg.edit_text(
+                f"❌ *فشلت الإضافة*\n" f"📧 `{data['email']}`\n" f"⚠️ {message}",
+                parse_mode="Markdown",
+            )
+
+    except Exception as e:
+        logger.exception(f"❌ Error adding account: {data['email']}")
+        await msg.edit_text(f"❌ خطأ غير متوقع: {str(e)}")
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر /search - البحث عن حساب"""
+    admin_ids = CONFIG["telegram"].get("admin_ids", [])
+
+    if not is_admin(update.effective_user.id, admin_ids):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📝 *الاستخدام:*\n`/search email@example.com`", parse_mode="Markdown"
+        )
+        return
+
+    email = context.args[0].strip().lower()
+    msg = await update.message.reply_text("🔍 جاري البحث...")
+
+    try:
+        result = await api_manager.search_sender_by_email(email)
+
+        if result:
+            status = result.get("Status", "غير محدد")
+            status_ar = get_status_description_ar(status)
+            account_id = result.get("idAccount", "N/A")
+
+            status_type = (
+                "نهائية ✅"
+                if status in FINAL_STATUSES
+                else (
+                    "انتقالية ⏳" if status in TRANSITIONAL_STATUSES else "غير محددة ❓"
+                )
+            )
+
+            text = (
+                f"✅ *تم العثور على الحساب*\n\n"
+                f"📧 `{result.get('Sender', email)}`\n"
+                f"🆔 ID: `{account_id}`\n"
+                f"👥 المجموعة: {result.get('Group', 'غير محدد')}\n\n"
+                f"📊 *الحالة:* `{status}`\n"
+                f"   {get_status_emoji(status)} {status_ar}\n"
+                f"   🎯 النوع: {status_type}\n\n"
+                f"📅 البداية: {format_number(result.get('Start', '0'))}\n"
+                f"🕐 آخر تحديث: {result.get('Last Update', 'غير محدد')}\n"
+                f"💰 اسحب: {format_number(result.get('Take', '0'))}\n"
+                f"💸 يسيب: {format_number(result.get('Keep', '0'))}\n"
+                f"✅ المسحوب: {format_number(result.get('Taken', '0'))}\n"
+                f"💵 المتاح: {format_number(result.get('Available', '0'))}"
+            )
+
+            accounts = load_monitored_accounts()
+            # تحقق بالـ ID
+            is_monitored = any(
+                d.get("account_id") == account_id for d in accounts.values()
+            )
+
+            if is_monitored:
+                text += f"\n\n🔄 *هذا الحساب تحت المراقبة* (ID-based)"
+
+            await msg.edit_text(text, parse_mode="Markdown")
+        else:
+            await msg.edit_text(
+                f"❌ لم يتم العثور على الحساب\n📧 `{email}`", parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.exception(f"❌ Search error: {email}")
+        await msg.edit_text(f"❌ خطأ في البحث: {str(e)}")
+
+
+async def monitored_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر /monitored - عرض الحسابات المراقبة مع pagination"""
+    admin_ids = CONFIG["telegram"].get("admin_ids", [])
+
+    if not is_admin(update.effective_user.id, admin_ids):
+        return
+
+    accounts = load_monitored_accounts()
+    if not accounts:
+        await update.message.reply_text("📭 لا توجد حسابات تحت المراقبة حالياً")
+        return
+
+    # ✅ عرض الصفحة الأولى
+    await send_monitored_page(update.message, page=1, accounts=accounts)
+
+
+def create_pagination_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """
+    إنشاء أزرار التنقل بين الصفحات
+
+    Format: [⬅️ السابق] [1/5] [التالي ➡️]
+    """
+    buttons = []
+
+    # زر السابق (يظهر فقط لو مش في الصفحة الأولى)
+    if page > 1:
+        buttons.append(
+            InlineKeyboardButton("⬅️ السابق", callback_data=f"mp:{page-1}:{total_pages}")
+        )
+
+    # زر الصفحة الحالية (غير قابل للضغط)
+    buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+
+    # زر التالي (يظهر فقط لو مش في آخر صفحة)
+    if page < total_pages:
+        buttons.append(
+            InlineKeyboardButton("التالي ➡️", callback_data=f"mp:{page+1}:{total_pages}")
+        )
+
+    return InlineKeyboardMarkup([buttons])
+
+
+async def send_monitored_page(message, page: int, accounts: dict):
+    """
+    عرض صفحة من الحسابات المراقبة (رسالة جديدة)
+
+    Args:
+        message: رسالة التليجرام
+        page: رقم الصفحة (يبدأ من 1)
+        accounts: dict الحسابات المراقبة
+    """
+    items_per_page = 10  # ✅ 10 حسابات لكل صفحة
+    accounts_list = list(accounts.items())
+    total_accounts = len(accounts_list)
+
+    # حساب عدد الصفحات
+    total_pages = max(1, (total_accounts + items_per_page - 1) // items_per_page)
+
+    # التأكد من رقم الصفحة صحيح
+    page = max(1, min(page, total_pages))
+
+    # حساب الحسابات المعروضة في الصفحة الحالية
+    start_idx = (page - 1) * items_per_page
+    end_idx = start_idx + items_per_page
+    page_accounts = accounts_list[start_idx:end_idx]
+
+    # بناء النص
+    text = f"📊 *الحسابات المراقبة* (صفحة {page}/{total_pages})\n"
+    text += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for idx, (key, data) in enumerate(page_accounts, start=start_idx + 1):
+        email = data.get("email", "unknown")
+        status = data.get("last_known_status", "N/A")
+        status_emoji = get_status_emoji(status)
+        source = "🤖" if data.get("source") == "bot" else "👤"
+        # ✅ سطر واحد بسيط لكل حساب
+        text += f"{idx}. {source} `{email}` | {status_emoji} `{status}`\n"
+
+    text += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"📈 الإجمالي: {total_accounts} حساب"
+
+    # إضافة أزرار التنقل (لو في أكتر من صفحة)
+    keyboard = None
+    if total_pages > 1:
+        keyboard = create_pagination_keyboard(page, total_pages)
+
+    await message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def update_monitored_page(message, page: int, accounts: dict):
+    """
+    تحديث صفحة موجودة (عند التنقل بين الصفحات)
+
+    نفس المنطق تماماً، لكن بدل reply_text نستخدم edit_text
+    """
+    items_per_page = 10
+    accounts_list = list(accounts.items())
+    total_accounts = len(accounts_list)
+    total_pages = max(1, (total_accounts + items_per_page - 1) // items_per_page)
+    page = max(1, min(page, total_pages))
+
+    start_idx = (page - 1) * items_per_page
+    end_idx = start_idx + items_per_page
+    page_accounts = accounts_list[start_idx:end_idx]
+
+    text = f"📊 *الحسابات المراقبة* (صفحة {page}/{total_pages})\n"
+    text += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for idx, (key, data) in enumerate(page_accounts, start=start_idx + 1):
+        email = data.get("email", "unknown")
+        status = data.get("last_known_status", "N/A")
+        status_emoji = get_status_emoji(status)
+        source = "🤖" if data.get("source") == "bot" else "👤"
+        text += f"{idx}. {source} `{email}` | {status_emoji} `{status}`\n"
+
+    text += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"📈 الإجمالي: {total_accounts} حساب"
+
+    keyboard = None
+    if total_pages > 1:
+        keyboard = create_pagination_keyboard(page, total_pages)
+
+    # ✅ استخدام edit_text بدل reply_text
+    await message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def handle_monitored_pagination(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """
+    معالج التنقل بين صفحات /monitored
+
+    Callback data format: mp:page:total_pages
+    مثال: mp:2:10 (الصفحة 2 من 10)
+    """
+    query = update.callback_query
+
+    try:
+        # ✅ فك تشفير البيانات
+        parts = query.data.split(":")
+        if len(parts) != 3:
+            raise ValueError("Invalid callback data format")
+
+        _, page_str, total_pages_str = parts
+        page = int(page_str)
+        total_pages = int(total_pages_str)
+
+        # ✅ التحقق من صحة رقم الصفحة
+        if page < 1 or page > total_pages:
+            await query.answer("❌ رقم صفحة غير صحيح", show_alert=True)
+            return
+
+        # ✅ التحقق من timeout (60 ثانية)
+        message_time = query.message.date
+        current_time = datetime.now(timezone.utc)  # ✅ FIX: استخدام timezone.utc
+        time_diff = (current_time - message_time).total_seconds()
+
+        if time_diff > 60:
+            await query.answer(
+                "⚠️ انتهت صلاحية القائمة. استخدم /monitored مرة أخرى.", show_alert=True
+            )
+            return
+
+        # ✅ تحميل الحسابات وعرض الصفحة
+        accounts = load_monitored_accounts()
+        if not accounts:
+            await query.answer("❌ لا توجد حسابات", show_alert=True)
+            return
+
+        await update_monitored_page(query.message, page, accounts)
+        await query.answer()  # ✅ إشعار بسيط (بدون نص)
+
+    except ValueError as e:
+        # ✅ معالجة أخطاء البيانات غير الصحيحة
+        logger.warning(f"Invalid pagination data: {query.data} - {e}")
+        await query.answer("❌ بيانات غير صحيحة", show_alert=True)
+    except Exception as e:
+        # ✅ معالجة الأخطاء العامة
+        logger.exception(f"Unexpected pagination error: {e}")
+        await query.answer("❌ حدث خطأ غير متوقع")
+
+
+async def handle_noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    معالج زر الصفحة الحالية (غير قابل للضغط)
+    """
+    query = update.callback_query
+    await query.answer()  # ✅ رد فارغ (مفيش action)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر /stats - عرض الإحصائيات"""
+    admin_ids = CONFIG["telegram"].get("admin_ids", [])
+
+    if not is_admin(update.effective_user.id, admin_ids):
+        return
+
+    from datetime import datetime
+
+    reset_time = datetime.fromisoformat(stats.last_reset)
+    hours = max((datetime.now() - reset_time).seconds / 3600, 0.01)
+    requests_per_hour = stats.total_requests / hours
+
+    text = (
+        "📊 *إحصائيات النظام*\n\n"
+        f"📈 إجمالي الطلبات: {stats.total_requests}\n"
+        f"⏱️ المعدل: {requests_per_hour:.1f} طلب/ساعة\n"
+        f"🚀 Burst activations: {stats.burst_activations}\n"
+        f"⚡ اكتشافات سريعة: {stats.fast_detections}\n"
+        f"🎯 TTL adjustments: {stats.adaptive_adjustments}\n"
+        f"🔄 CSRF refreshes: {stats.csrf_refreshes}\n"
+        f"📦 Batch fetches: {stats.batch_fetches}\n"
+        f"💾 Cache hits: {stats.cache_hits}\n"
+        f"❌ Errors: {stats.errors}\n"
+        f"💾 Cache rate: {(stats.cache_hits / max(stats.total_requests, 1) * 100):.1f}%\n\n"
+        f"⚡ Mode: Adaptive Hybrid\n"
+        f"🧠 Current TTL: {smart_cache.cache_ttl:.0f}s\n"
+        f"🕐 منذ: {reset_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر /status - حالة النظام"""
+    admin_ids = CONFIG["telegram"].get("admin_ids", [])
+
+    if not is_admin(update.effective_user.id, admin_ids):
+        return
+
+    from datetime import datetime
+
+    accounts = load_monitored_accounts()
+    csrf_valid = (
+        api_manager.csrf_expires_at and datetime.now() < api_manager.csrf_expires_at
+    )
+
+    cache_age = "N/A"
+    if smart_cache.cache_timestamp:
+        age = (datetime.now() - smart_cache.cache_timestamp).total_seconds()
+        cache_age = f"{age:.0f}s"
+
+    api_enabled = CONFIG.get("api", {}).get("enabled", False)
+    sheets_enabled = CONFIG.get("google_sheet", {}).get("enabled", False)
+
+    text = (
+        "*📊 حالة النظام*\n\n"
+        f"🤖 البوت: ✅ شغال\n"
+        f"⚡ Mode: *Adaptive Hybrid*\n"
+        f"🌐 Web API: {'✅ نشط' if api_enabled else '❌ معطل'}\n"
+        f"📊 Google Sheets: {'✅ نشط' if sheets_enabled else '❌ معطل'}\n\n"
+        f"🔑 CSRF Token: {'✅ صالح' if csrf_valid else '⚠️ منتهي'}\n"
+        f"💾 Cache Status: {'✅ نشط' if smart_cache.cache else '❌ فارغ'}\n"
+        f"🕐 Cache Age: {cache_age}\n"
+        f"🧠 Current TTL: {smart_cache.cache_ttl:.0f}s\n"
+        f"🚀 Burst Mode: {'✅ نشط' if smart_cache.burst_mode_active else '❌ معطل'}\n"
+        f"🔄 الحسابات المراقبة: {len(accounts)}\n\n"
+        f"*⚡ التحسينات:*\n"
+        f"• Strict ID validation: ✅\n"
+        f"• Burst mode (60s): ✅\n"
+        f"• Smart TTL (2-10min): ✅\n"
+        f"• Source tracking: ✅\n"
+        f"• Auto-discovery: ✅\n"
+        f"• Instant Sheets sync: ✅\n"
+        f"• Fallback mechanism: ✅\n"
+        f"• Bilingual display: ✅\n"
+        f"• Web API integration: {'✅' if api_enabled else '❌'}\n"
+        f"• Google Sheets sync: {'✅' if sheets_enabled else '❌'}"
+    )
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🚀 Initialization & Main Function
+# ═══════════════════════════════════════════════════════════════
+
+
+async def post_init(application: Application):
+    """
+    التهيئة بعد بدء البوت
+    """
+    global api_manager
+
+    logger.info("🔧 Initializing API Manager...")
+    await api_manager.initialize()
+
+    # ------------------- تشغيل الـ Workers الأساسية -------------------
+
+    # المراقب المستمر للحسابات
+    default_group_name = CONFIG["website"]["defaults"]["group_name"]
+    admin_ids = CONFIG["telegram"].get("admin_ids", [])
+    default_chat_id = admin_ids[0] if admin_ids else None
+    logger.info("🔄 Starting background monitor (with auto-discovery)...")
+    asyncio.create_task(
+        continuous_monitor(
+            api_manager,
+            application.bot,
+            default_group_name,
+            default_chat_id,
+        )
+    )
+
+    # Web API (إذا كان مفعّلاً)
+    if CONFIG.get("api", {}).get("enabled", False):
+        logger.info("🌐 Starting Web API...")
+        asyncio.create_task(start_web_api(CONFIG, api_manager))
+
+    # ------------------- تشغيل أنظمة Google Sheets -------------------
+
+    # استيراد الـ workers اللازمة من مجلد sheets
+    from sheets.error_notifier import start_error_notification_worker
+    from sheets.worker import start_sheet_worker
+
+    # ✅ تشغيل نظام إشعارات الأخطاء أولاً وبشكل مستقل
+    if CONFIG.get("sheets_error_notifications", {}).get("enabled", False):
+        logger.info("🚨 Starting Sheets Error Notification Worker...")
+        asyncio.create_task(start_error_notification_worker(CONFIG, application.bot))
+    else:
+        logger.info("⚪ Sheets Error Notification Worker is disabled.")
+
+    # ✅ تشغيل الـ workers الخاصة بـ Google Sheets (بدون تمرير application)
+    if CONFIG.get("google_sheet", {}).get("enabled", False):
+        logger.info("📊 Starting Google Sheets Data Workers...")
+        asyncio.create_task(start_sheet_worker(CONFIG))
+
+    # 🔧 تسجيل معالجات تعديل السيندر
+    logger.info("🔧 Registering Edit Sender Handlers...")
+    edit_sender_module.register_handlers(application)
+    
+    # 🆕 تعيين api_manager للوحدة
+    edit_sender_module.set_api_manager(api_manager)
+
+    logger.info("✅ System is fully operational!")
+
+
+def main():
+    """
+    🚀 تشغيل البوت الرئيسي
+    """
+    global telegram_app, api_manager
+
+    print("\n" + "=" * 60)
+    print("🚀 SMART SENDER BOT - ADAPTIVE HYBRID MODE")
+    print("=" * 60)
+    print("🧠 Architecture:")
+    print("   • Smart Cache with adaptive TTL (2-10 min)")
+    print("   • Strict ID Validation (account_id based)")
+    print("   • Temporary Burst Mode (60s on new accounts)")
+    print("   • Source Tracking (bot/manual)")
+    print("   • Auto-Discovery (AVAILABLE + default group)")
+    print("   • Instant Google Sheets Sync on ID detection")
+    print("   • Fallback Mechanism (resilient to errors)")
+    print("   • Bilingual Status Display (EN/AR)")
+    print("   • Web API Integration (FastAPI/aiohttp)")
+    print("\n📊 Intelligent & Efficient!")
+    print("=" * 60 + "\n")
+
+    # 🛡️ التحقق من إعدادات الإشعارات
+    try:
+        from core import validate_notification_config
+
+        validate_notification_config(CONFIG)
+    except Exception as e:
+        print(f"❌ Notification config validation failed: {e}")
+        print("⚠️ Bot will start, but notifications may not work properly!")
+
+    # إنشاء API Manager
+    api_manager = OptimizedAPIManager(CONFIG)
+
+    # إنشاء تطبيق Telegram
+    telegram_app = (
+        Application.builder()
+        .token(CONFIG["telegram"]["bot_token"])
+        .post_init(post_init)
+        .build()
+    )
+
+    # إضافة معالجات الأوامر
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("search", search_command))
+    telegram_app.add_handler(CommandHandler("monitored", monitored_command))
+    telegram_app.add_handler(CommandHandler("stats", stats_command))
+    telegram_app.add_handler(CommandHandler("status", status_command))
+
+    # ✅ معالجات الـ pagination
+    telegram_app.add_handler(
+        CallbackQueryHandler(handle_monitored_pagination, pattern="^mp:")
+    )
+    telegram_app.add_handler(
+        CallbackQueryHandler(handle_noop_callback, pattern="^noop$")
+    )
+
+    telegram_app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
+
+    print("✅ Bot is running in Adaptive Hybrid Mode!")
+    print("🧠 Smart TTL: 2-10 minutes (adaptive)")
+    print("🚀 Burst Mode: 60s on new accounts")
+    print("🎯 ID-based validation enabled")
+    print("🆕 Source tracking: bot/manual")
+    print("🆕 Auto-discovery: ON")
+    print("🆕 Instant pending.json addition on ID detection")
+    print("🌐 Web API: " + ("ON" if CONFIG.get("api", {}).get("enabled") else "OFF"))
+    print(
+        "📊 Google Sheets: "
+        + ("ON" if CONFIG.get("google_sheet", {}).get("enabled") else "OFF")
+    )
+    print("📊 Check /stats for metrics\n")
+
+    # تشغيل البوت
+    telegram_app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n⚠️ Bot stopped by user")
+        stats.save()
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        logger.exception("❌ Fatal error occurred")
+        stats.save()
+    finally:
+        import asyncio
+
+        if api_manager:
+            asyncio.run(api_manager.close())
+        
+        # تنظيف موارد edit_sender
+        asyncio.run(edit_sender_module.cleanup())
